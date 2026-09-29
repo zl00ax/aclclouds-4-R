@@ -17,6 +17,8 @@ const VOCAB = [
   'Minecraft', 'Discord', 'Housing', 'Tunnel', 'Dedicated',
   'Free', 'Upgrade', 'Renew', 'Game', 'Node', 'Credit', 'Support'
 ];
+const OCR_MIN_SCORE = Math.max(30, Math.min(100, Number.parseInt(process.env.ACL_CAPTCHA_OCR_MIN_SCORE || '65', 10)));
+const CAPTCHA_MAX_ATTEMPTS = Math.max(1, Math.min(6, Number.parseInt(process.env.ACL_CAPTCHA_MAX_ATTEMPTS || '3', 10)));
 
 fs.mkdirSync(SHOT, { recursive: true });
 const shots = [];
@@ -48,6 +50,36 @@ function score(a, b) {
 
 function ocrScore(text, guess, prompt) {
   return Math.max(score(text, prompt), score(guess, prompt));
+}
+
+function decodeCaptchaOption(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+function pickByOptionText(prompt, options = []) {
+  const ranked = options
+    .map((raw, i) => {
+      const text = decodeCaptchaOption(raw);
+      return { i, raw, text, s: score(text, prompt) };
+    })
+    .sort((a, b) => b.s - a.s);
+
+  if (!ranked.length) return null;
+  const top = ranked[0];
+  const second = ranked[1]?.s ?? -1;
+  const hasStrongMatch = top.s >= 85;
+  const hasClearLead = top.s >= 70 && top.s - second >= 20;
+
+  if (hasStrongMatch || hasClearLead) {
+    return top;
+  }
+  return null;
 }
 
 async function shot(page, name) {
@@ -178,7 +210,7 @@ async function ocrPick(dir, prompt, n) {
   await worker.terminate();
   results.sort((a, b) => b.vsPrompt - a.vsPrompt);
   log(`OCR prompt=${prompt} ${results.map((x) => `${x.i}:${x.text || x.guess}(${x.vsPrompt})`).join(' ')}`);
-  if (!results[0] || results[0].vsPrompt < 75) throw new Error(`OCR 未匹配 ${prompt}: ${JSON.stringify(results)}`);
+  if (!results[0] || results[0].vsPrompt < OCR_MIN_SCORE) throw new Error(`OCR 未匹配 ${prompt} (阈值:${OCR_MIN_SCORE}): ${JSON.stringify(results)}`);
   return results[0].i;
 }
 
@@ -224,67 +256,94 @@ async function solveCaptcha(page, prefix = '') {
 
 async function solveCaptchaApi(page, context = 'renewal_gate') {
   log(`通过 API 求解验证码 (context: ${context})...`);
-  const challengeRes = await api(page, `/auth/captcha/challenge?context=${encodeURIComponent(context)}`);
-  if (challengeRes.status !== 200 || !challengeRes.data?.id) {
-    throw new Error(`获取验证码 challenge 失败: HTTP ${challengeRes.status}`);
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= CAPTCHA_MAX_ATTEMPTS; attempt++) {
+    try {
+      if (attempt > 1) {
+        log(`API 验证码重试 ${attempt}/${CAPTCHA_MAX_ATTEMPTS}`);
+      }
+
+      const challengeRes = await api(page, `/auth/captcha/challenge?context=${encodeURIComponent(context)}`);
+      if (challengeRes.status !== 200 || !challengeRes.data?.id) {
+        throw new Error(`获取验证码 challenge 失败: HTTP ${challengeRes.status}`);
+      }
+      const chal = challengeRes.data;
+      await page.waitForTimeout(1200);
+
+      const initialVerify = await api(page, '/auth/captcha', 'POST', {
+        context: chal.context || context,
+        id: chal.id,
+        ts: chal.ts,
+        sig: chal.sig,
+        elapsed: 1400,
+      });
+
+      if (initialVerify.status !== 200) {
+        throw new Error(`验证码初始验证失败: HTTP ${initialVerify.status}`);
+      }
+
+      const ver = initialVerify.data;
+      if (ver.passed && ver.token) {
+        log('验证码无感直通成功');
+        return ver.token;
+      }
+
+      if (!ver.interactive || !ver.target || !Array.isArray(ver.options)) {
+        throw new Error(`验证码返回非交互态: ${JSON.stringify(ver)}`);
+      }
+
+      const target = ver.target;
+      const options = ver.options;
+      const directPick = pickByOptionText(target, options);
+      let pick = -1;
+
+      if (directPick) {
+        pick = directPick.i;
+        log(`验证码命中文本选项: prompt=${target} option=${directPick.text} score=${directPick.s}`);
+      } else {
+        const dir = path.join(SHOT, 'captcha_api');
+        fs.mkdirSync(dir, { recursive: true });
+
+        for (let i = 0; i < options.length; i++) {
+          const imgUrl = `${BASE}/auth/captcha/image?t=${encodeURIComponent(options[i])}`;
+          const bytes = await page.evaluate(async (u) => {
+            const r = await fetch(u, { credentials: 'include' });
+            return Array.from(new Uint8Array(await r.arrayBuffer()));
+          }, imgUrl);
+          fs.writeFileSync(path.join(dir, `${i}.png`), Buffer.from(bytes));
+        }
+
+        pick = await ocrPick(dir, target, options.length);
+      }
+
+      const selectedOption = options[pick];
+      const submitVerify = await api(page, '/auth/captcha', 'POST', {
+        context: ver.context || context,
+        id: ver.id,
+        ts: ver.ts,
+        sig: ver.sig,
+        answer: selectedOption,
+        answer_sig: ver.answer_sig || '',
+        target: target,
+      });
+
+      if (submitVerify.status === 200 && submitVerify.data?.passed && submitVerify.data?.token) {
+        log(`API 验证码成功解决: ${target} -> token 获得`);
+        return submitVerify.data.token;
+      }
+
+      throw new Error(`API 验证码选项提交未通过: ${JSON.stringify(submitVerify.data)}`);
+    } catch (e) {
+      lastErr = e;
+      log(`API 验证码第 ${attempt} 次失败: ${e.message}`);
+      if (attempt < CAPTCHA_MAX_ATTEMPTS) {
+        await page.waitForTimeout(1200);
+      }
+    }
   }
-  const chal = challengeRes.data;
-  await page.waitForTimeout(1200);
 
-  const initialVerify = await api(page, '/auth/captcha', 'POST', {
-    context: chal.context || context,
-    id: chal.id,
-    ts: chal.ts,
-    sig: chal.sig,
-    elapsed: 1400,
-  });
-
-  if (initialVerify.status !== 200) {
-    throw new Error(`验证码初始验证失败: HTTP ${initialVerify.status}`);
-  }
-
-  const ver = initialVerify.data;
-  if (ver.passed && ver.token) {
-    log('验证码无感直通成功');
-    return ver.token;
-  }
-
-  if (!ver.interactive || !ver.target || !Array.isArray(ver.options)) {
-    throw new Error(`验证码返回非交互态: ${JSON.stringify(ver)}`);
-  }
-
-  const target = ver.target;
-  const options = ver.options;
-  const dir = path.join(SHOT, 'captcha_api');
-  fs.mkdirSync(dir, { recursive: true });
-
-  for (let i = 0; i < options.length; i++) {
-    const imgUrl = `${BASE}/auth/captcha/image?t=${encodeURIComponent(options[i])}`;
-    const bytes = await page.evaluate(async (u) => {
-      const r = await fetch(u, { credentials: 'include' });
-      return Array.from(new Uint8Array(await r.arrayBuffer()));
-    }, imgUrl);
-    fs.writeFileSync(path.join(dir, `${i}.png`), Buffer.from(bytes));
-  }
-
-  const pick = await ocrPick(dir, target, options.length);
-  const selectedOption = options[pick];
-
-  const submitVerify = await api(page, '/auth/captcha', 'POST', {
-    context: ver.context || context,
-    id: ver.id,
-    ts: ver.ts,
-    sig: ver.sig,
-    answer: selectedOption,
-    answer_sig: ver.answer_sig || '',
-    target: target,
-  });
-
-  if (submitVerify.status === 200 && submitVerify.data?.passed && submitVerify.data?.token) {
-    log(`API 验证码成功解决: ${target} -> token 获得`);
-    return submitVerify.data.token;
-  }
-  throw new Error(`API 验证码选项提交未通过: ${JSON.stringify(submitVerify.data)}`);
+  throw new Error(`API 验证码连续失败 ${CAPTCHA_MAX_ATTEMPTS} 次: ${lastErr?.message || '未知错误'}`);
 }
 
 async function api(page, p, method = 'GET', body) {
